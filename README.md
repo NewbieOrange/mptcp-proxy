@@ -225,3 +225,7 @@ The integration tests emulate rate-limited rinetd paths with in-process TCP
 relays. They cover large transfers, upload and download aggregation, every path
 being used, half-close, concurrent sessions, failover of a path in the middle
 of a transfer, and recovery after all paths disconnect and reconnect.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
