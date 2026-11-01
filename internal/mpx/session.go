@@ -32,11 +32,13 @@ type Session struct {
 	noPathTimer  *time.Timer
 	noPathEpoch  uint64
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	startOnce sync.Once
-	closeOnce sync.Once
-	closed    chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
+	startOnce       sync.Once
+	closeOnce       sync.Once
+	establishedOnce sync.Once
+	established     chan struct{}
+	closed          chan struct{}
 
 	inDone  atomic.Bool
 	outDone atomic.Bool
@@ -48,15 +50,16 @@ type Session struct {
 func newSession(id [16]byte, cfg Config, onClose func(*Session)) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
-		id:        id,
-		cfg:       cfg,
-		logger:    cfg.Logger,
-		verbose:   cfg.Verbose,
-		ctx:       ctx,
-		cancel:    cancel,
-		closed:    make(chan struct{}),
-		onClose:   onClose,
-		createdAt: time.Now(),
+		id:          id,
+		cfg:         cfg,
+		logger:      cfg.Logger,
+		verbose:     cfg.Verbose,
+		ctx:         ctx,
+		cancel:      cancel,
+		established: make(chan struct{}),
+		closed:      make(chan struct{}),
+		onClose:     onClose,
+		createdAt:   time.Now(),
 	}
 	s.sender = newSender(s)
 	s.receiver = newReceiver(s)
@@ -77,6 +80,17 @@ func (s *Session) attach(source, dest net.Conn) error {
 // addPath registers a component connection. It starts the path immediately if
 // the session has already started; otherwise start will do it.
 func (s *Session) addPath(conn net.Conn, clientPathID uint16) (*Path, error) {
+	return s.addPathMode(conn, clientPathID, false, 0)
+}
+
+// addPathEarly registers a path whose HELLO has been sent but whose ACK has not
+// been read yet. The write side may start immediately so application bytes can
+// be pipelined; the read side starts only after the handshake completes.
+func (s *Session) addPathEarly(conn net.Conn, clientPathID uint16, rttHint time.Duration) (*Path, error) {
+	return s.addPathMode(conn, clientPathID, true, rttHint)
+}
+
+func (s *Session) addPathMode(conn net.Conn, clientPathID uint16, early bool, rttHint time.Duration) (*Path, error) {
 	select {
 	case <-s.closed:
 		return nil, errSessionClosed
@@ -92,7 +106,8 @@ func (s *Session) addPath(conn net.Conn, clientPathID uint16) (*Path, error) {
 	s.cancelNoPathTimerLocked()
 	id := s.nextPathID
 	s.nextPathID++
-	p := newPath(s, id, clientPathID, conn)
+	p := newPath(s, id, clientPathID, conn, early)
+	p.noteRTT(rttHint)
 	s.paths = append(s.paths, p)
 	started := s.pathsStarted
 	s.pathMu.Unlock()
@@ -102,6 +117,10 @@ func (s *Session) addPath(conn net.Conn, clientPathID uint16) (*Path, error) {
 	}
 	s.sender.pathAdded()
 	return p, nil
+}
+
+func (s *Session) markPathEstablished() {
+	s.establishedOnce.Do(func() { close(s.established) })
 }
 
 func (s *Session) start() {

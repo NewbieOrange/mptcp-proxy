@@ -9,8 +9,11 @@ import (
 )
 
 func startProxyPairDelays(t *testing.T, target string, delays []time.Duration) string {
+	return startProxyPairDelaysConfig(t, target, delays, testConfig())
+}
+
+func startProxyPairDelaysConfig(t *testing.T, target string, delays []time.Duration, cfg Config) string {
 	t.Helper()
-	cfg := testConfig()
 	srv, err := NewServer(cfg, target)
 	if err != nil {
 		t.Fatal(err)
@@ -37,6 +40,21 @@ func startProxyPairDelays(t *testing.T, target string, delays []time.Duration) s
 	}
 	go func() { _ = cli.Serve(clientLn) }()
 	t.Cleanup(func() { _ = cli.Close() })
+	if cfg.FastOpen {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			cli.healthMu.Lock()
+			ready := cli.healthReady
+			cli.healthMu.Unlock()
+			if ready {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("health probes did not become ready")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	return clientLn.Addr().String()
 }
 
@@ -138,6 +156,22 @@ func TestLatencySimulation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		addr := startProxyPairDelays(t, target.Addr(), tc.delays)
+		measureNewConnections(t, tc.name, addr, n)
+		measurePersistent(t, tc.name+" persistent", addr, n)
+	}
+
+	fastCfg := testConfig()
+	fastCfg.FastOpen = true
+	fastCfg.HealthInterval = time.Hour
+	for _, tc := range []struct {
+		name   string
+		delays []time.Duration
+	}{
+		{"fastopen 5 paths all 10ms", []time.Duration{fast, fast, fast, fast, fast}},
+		{"fastopen slow first", []time.Duration{slow, fast, fast, fast, fast}},
+		{"fastopen slow last", []time.Duration{fast, fast, fast, fast, slow}},
+	} {
+		addr := startProxyPairDelaysConfig(t, target.Addr(), tc.delays, fastCfg)
 		measureNewConnections(t, tc.name, addr, n)
 		measurePersistent(t, tc.name+" persistent", addr, n)
 	}

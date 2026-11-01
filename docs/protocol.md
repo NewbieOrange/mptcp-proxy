@@ -57,6 +57,12 @@ server no longer has that session, it replies with `session not found` instead
 of creating a new target connection; the client then closes the application
 connection because its stream state cannot be resumed.
 
+Bit 1 is `PROBE`. It asks the server to dial the target, return a normal
+HELLO_ACK, and close both connections without creating a session or installing
+the path. The client uses this on a separate control connection to check that a
+relay and the target are healthy, then evicts failing paths from new
+connections.
+
 ## HELLO_ACK
 
 HELLO_ACK has a 28-byte fixed part followed by an optional UTF-8 error message:
@@ -88,6 +94,12 @@ starts forwarding as soon as the first path completes its handshake (or fails
 after the connect-wait deadline). The remaining paths join the already-active
 session, so a slow handshake does not delay the application connection.
 
+In fastopen mode, the client also allows DATA frames to follow HELLO on the
+same TCP connection before HELLO_ACK arrives. The server buffers them until the
+target connection is ready and the path is installed. If the target connection
+or handshake fails, the client closes the session rather than continuing with
+unacknowledged optimistic bytes.
+
 ## Data transfer and flow control
 
 The sender reads from its source socket in chunks and assigns consecutive
@@ -106,6 +118,10 @@ Each path also tracks RTT from PING/PONG probes. When a sender is idle or has at
 most two chunks in flight, it prefers the lowest-RTT path. This keeps short
 request/response bursts and interactive traffic off high-latency paths; bulk
 transfers use the rate-based multipath scheduler.
+
+In fastopen mode, RTTs measured by the background health probes are copied into
+newly created paths. The first application chunks can therefore use the
+lowest-latency path immediately, before the new path's own PING/PONG completes.
 
 Upload and download use separate scheduler and sequence-number instances.
 Neither direction limits the other.

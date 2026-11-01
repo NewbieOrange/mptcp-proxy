@@ -106,9 +106,11 @@ func runClient(args []string) {
 	fs := flag.NewFlagSet("mptcp-proxy client", flag.ExitOnError)
 	common := addCommonFlags(fs)
 	listen := fs.String("listen", "127.0.0.1:8080", "local TCP address to accept application connections on")
-	connectWait := fs.Duration("connect-wait", 5*time.Second, "maximum time to establish all paths")
+	connectWait := fs.Duration("connect-wait", 5*time.Second, "maximum time to establish the first path")
 	reconnectMin := fs.Duration("reconnect-min", 250*time.Millisecond, "minimum delay before reconnecting a failed path")
 	reconnectMax := fs.Duration("reconnect-max", 5*time.Second, "maximum delay before reconnecting a failed path")
+	fastOpen := fs.Bool("fastopen", false, "send application bytes before path handshakes complete and probe paths in the background")
+	healthInterval := fs.Duration("health-interval", 30*time.Second, "background path/target probe interval in fastopen mode")
 	fs.Var(&paths, "paths", "comma-separated path addresses (host:port); may be repeated")
 	_ = fs.Parse(args)
 
@@ -121,6 +123,8 @@ func runClient(args []string) {
 	cfg.ConnectWait = *connectWait
 	cfg.ReconnectMin = *reconnectMin
 	cfg.ReconnectMax = *reconnectMax
+	cfg.FastOpen = *fastOpen
+	cfg.HealthInterval = *healthInterval
 
 	client, err := mpx.NewClient(cfg, paths)
 	if err != nil {

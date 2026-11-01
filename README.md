@@ -31,6 +31,10 @@ a normal TCP connection to `127.0.0.1:8080`.
 - Connection setup starts on the first path that finishes its handshake, not
   the slowest one. Short request/response bursts use the lowest-RTT path;
   bulk traffic switches to multipath throughput scheduling.
+- Optional `-fastopen` mode pipelines application bytes immediately after each
+  path's HELLO, before the path acknowledgement. A background control probe
+  checks every relay and the target, and marks failed paths unhealthy so new
+  connections skip them until they recover.
 - Independent sequence numbers and acknowledgement windows in each direction.
 - Fast receive acknowledgements drive path scheduling; delivery
   acknowledgements are sent only after data has been written to the destination
@@ -117,11 +121,26 @@ On the machine running the application:
 Then point the application at `127.0.0.1:8080`. Every accepted application
 connection opens all four paths and uses them concurrently in both directions.
 Traffic starts as soon as the first path is ready; the remaining paths join
-while the connection is already active. Each path has its own reconnect loop: if one fails, it is removed immediately,
-in-flight chunks move to the remaining paths, and the client keeps trying to
-re-establish that path with backoff. A recovered path rejoins the same session.
-The session stays open while all paths are temporarily down, up to
-`-no-path-timeout`.
+while the connection is already active. Each path has its own reconnect loop:
+if one fails, it is removed immediately, in-flight chunks move to the remaining
+paths, and the client keeps trying to re-establish that path with backoff. A
+recovered path rejoins the same session. The session stays open while all paths
+are temporarily down, up to `-no-path-timeout`.
+
+For the lowest connection-establishment latency, enable fastopen mode:
+
+```sh
+./bin/mptcp-proxy client \
+  -listen 127.0.0.1:8080 \
+  -paths a:8080,b:8080,c:8080,d:8080 \
+  -fastopen
+```
+
+In fastopen mode the client probes all paths and the target in the background
+at startup and every `-health-interval`. Unhealthy paths are excluded from new
+connections. Application bytes are sent optimistically after HELLO, before the
+server acknowledges the path; if the target or handshake fails, the affected
+connection is closed rather than silently losing data.
 
 `-paths` may also be repeated:
 
@@ -151,6 +170,8 @@ single small request may legitimately fit on one path.
 | `-chunk` | 64 KiB | Application bytes per multipath frame. |
 | `-queue` | 512 KiB | Approximate per-path data backlog. Smaller means less head-of-line delay; larger smooths bursts. |
 | `-connect-wait` | 5s | How long the client waits for the first path before failing a new connection. |
+| `-fastopen` | off | Pipeline application data before path handshakes complete and run background path/target probes. |
+| `-health-interval` | 30s | Fastopen background probe interval. |
 | `-dial-timeout` | 5s | Timeout for dialing one path or the target. |
 | `-reconnect-min` | 250ms | Initial delay before re-dialing a failed client path. |
 | `-reconnect-max` | 5s | Maximum reconnect backoff. |
@@ -191,6 +212,13 @@ the rate-based multipath scheduler takes over.
 Upload and download each have their own sender, sequence space, window, and
 path accounting, so both directions aggregate independently.
 
+With `-fastopen`, the client registers a path as soon as its HELLO has been
+written and allows the sender to use it immediately. The server buffers any
+early DATA until it has created the target connection and installed the path.
+Background probes use a dedicated control handshake that connects to the
+target and closes without creating a session; their results drive path
+eviction and RTT ordering for new connections.
+
 The receiver buffers out-of-order chunks and writes the stream to the local
 socket strictly in sequence order. It sends a fast "received" acknowledgement
 when a chunk enters the reassembly buffer, which is used for path scheduling. A
@@ -221,6 +249,9 @@ More protocol details are in [docs/protocol.md](docs/protocol.md).
   New application connections work normally after the server returns.
 - A path that is alive but extremely slow can still add some head-of-line
   delay. Reducing `-queue` limits how much work can pile up behind it.
+- Fastopen probes open and close one connection to the target per configured
+  path every health interval. Use a longer `-health-interval` if the target
+  application is sensitive to probe connections.
 - Memory use is roughly bounded by `-window` plus the path queues per active
   connection, in each direction of the proxy.
 
@@ -235,8 +266,9 @@ The integration tests emulate rate-limited and latency-delayed rinetd paths
 with in-process TCP relays. They cover large transfers, upload and download
 aggregation, every path being used, half-close, concurrent sessions, failover
 of a path in the middle of a transfer, recovery after all paths disconnect and
-reconnect, and a local latency simulation comparing single-relay and
-multipath request/response times.
+reconnect, fastopen early-data operation, background path eviction, and a
+local latency simulation comparing single-relay, multipath, and fastopen
+request/response times.
 
 ## License
 

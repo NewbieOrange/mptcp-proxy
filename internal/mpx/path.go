@@ -34,9 +34,11 @@ type Path struct {
 	sendQ   chan *outItem
 	done    chan struct{}
 
-	startOnce sync.Once
-	dead      atomic.Bool
-	writeMu   sync.Mutex
+	writerOnce  sync.Once
+	readerOnce  sync.Once
+	earlyReader bool
+	dead        atomic.Bool
+	writeMu     sync.Mutex
 
 	outstandingBytes atomic.Int64
 	rateBps          atomic.Int64
@@ -54,7 +56,7 @@ type Path struct {
 	creditAt time.Time
 }
 
-func newPath(s *Session, id uint32, clientPathID uint16, conn net.Conn) *Path {
+func newPath(s *Session, id uint32, clientPathID uint16, conn net.Conn, earlyReader bool) *Path {
 	return &Path{
 		id:           id,
 		clientPathID: clientPathID,
@@ -63,15 +65,31 @@ func newPath(s *Session, id uint32, clientPathID uint16, conn net.Conn) *Path {
 		conn:         conn,
 		sendQ:        make(chan *outItem, s.cfg.pathQueueChunks()),
 		done:         make(chan struct{}),
+		earlyReader:  earlyReader,
 	}
 }
 
 func (p *Path) start() {
-	p.startOnce.Do(func() {
+	p.startWriter()
+	if !p.earlyReader {
+		p.startReader()
+	}
+}
+
+func (p *Path) startWriter() {
+	p.writerOnce.Do(func() {
 		if p.dead.Load() {
 			return
 		}
 		go p.writeLoop()
+	})
+}
+
+func (p *Path) startReader() {
+	p.readerOnce.Do(func() {
+		if p.dead.Load() {
+			return
+		}
 		go p.readLoop()
 	})
 }

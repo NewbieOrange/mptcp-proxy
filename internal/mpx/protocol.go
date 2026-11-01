@@ -42,15 +42,19 @@ const (
 	helloStatusSessionNotFound
 )
 
-const helloFlagResume uint8 = 1 << 0
+const (
+	helloFlagResume uint8 = 1 << 0
+	helloFlagProbe  uint8 = 1 << 1
+)
 
 var (
-	errProtocol        = errors.New("mpx: protocol error")
-	errSessionClosed   = errors.New("mpx: session closed")
-	errSessionNotFound = errors.New("mpx: session no longer exists on server")
-	errNoPaths         = errors.New("mpx: no usable paths")
-	errFrameTooLarge   = errors.New("mpx: frame too large")
-	errHandshake       = errors.New("mpx: handshake failed")
+	errProtocol          = errors.New("mpx: protocol error")
+	errSessionClosed     = errors.New("mpx: session closed")
+	errSessionNotFound   = errors.New("mpx: session no longer exists on server")
+	errTargetUnavailable = errors.New("mpx: target unavailable")
+	errNoPaths           = errors.New("mpx: no usable paths")
+	errFrameTooLarge     = errors.New("mpx: frame too large")
+	errHandshake         = errors.New("mpx: handshake failed")
 )
 
 type wireFrame struct {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,16 @@ type Client struct {
 	logger interface {
 		Printf(string, ...any)
 	}
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	monitorOnce sync.Once
+	healthMu    sync.Mutex
+	healthReady bool
+	healthKnown map[int]bool
+	healthUp    map[int]bool
+	healthRTT   map[int]time.Duration
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -53,11 +64,17 @@ func NewClient(cfg Config, paths []string) (*Client, error) {
 	if len(clean) == 0 {
 		return nil, fmt.Errorf("at least one path is required")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
-		cfg:      cfg,
-		paths:    clean,
-		logger:   cfg.Logger,
-		sessions: make(map[*Session]struct{}),
+		cfg:         cfg,
+		paths:       clean,
+		logger:      cfg.Logger,
+		ctx:         ctx,
+		cancel:      cancel,
+		healthKnown: make(map[int]bool),
+		healthUp:    make(map[int]bool),
+		healthRTT:   make(map[int]time.Duration),
+		sessions:    make(map[*Session]struct{}),
 	}, nil
 }
 
@@ -79,7 +96,14 @@ func (c *Client) Serve(ln net.Listener) error {
 	c.listener = ln
 	c.mu.Unlock()
 
-	c.logger.Printf("client listening on %s over %d path(s): %s", ln.Addr(), len(c.paths), strings.Join(c.paths, ", "))
+	if c.cfg.FastOpen {
+		c.startMonitor()
+	}
+	mode := ""
+	if c.cfg.FastOpen {
+		mode = " fastopen"
+	}
+	c.logger.Printf("client listening on %s over %d path(s)%s: %s", ln.Addr(), len(c.paths), mode, strings.Join(c.paths, ", "))
 	defer func() {
 		c.mu.Lock()
 		if c.listener == ln {
@@ -114,6 +138,7 @@ func (c *Client) Close() error {
 	}
 	c.mu.Unlock()
 
+	c.cancel()
 	if ln != nil {
 		_ = ln.Close()
 	}
@@ -135,6 +160,129 @@ type pathAttemptResult struct {
 	err   error
 }
 
+func (c *Client) startMonitor() {
+	c.monitorOnce.Do(func() {
+		go c.monitorLoop()
+	})
+}
+
+func (c *Client) monitorLoop() {
+	for {
+		c.probeAll()
+		timer := time.NewTimer(c.cfg.HealthInterval)
+		select {
+		case <-c.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) probeAll() {
+	var wg sync.WaitGroup
+	for i, addr := range c.paths {
+		wg.Add(1)
+		go func(index int, address string) {
+			defer wg.Done()
+			c.probePath(index, address)
+		}(i, addr)
+	}
+	wg.Wait()
+
+	c.healthMu.Lock()
+	c.healthReady = true
+	c.healthMu.Unlock()
+}
+
+func (c *Client) probePath(index int, addr string) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, c.cfg.HandshakeTimeout)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := c.connectPathFlags(ctx, id, uint16(index), addr, helloFlagProbe)
+	if err != nil {
+		c.markPathDown(index)
+		if c.cfg.Verbose {
+			c.logger.Printf("health path %d (%s): %v", index, addr, err)
+		}
+		return
+	}
+	_ = conn.Close()
+	rtt := time.Since(start)
+	c.markPathUp(index, rtt)
+	if c.cfg.Verbose {
+		c.logger.Printf("health path %d (%s): ok rtt=%s", index, addr, rtt.Round(time.Microsecond))
+	}
+}
+
+func (c *Client) markPathUp(index int, rtt time.Duration) {
+	if !c.cfg.FastOpen {
+		return
+	}
+	c.healthMu.Lock()
+	c.healthKnown[index] = true
+	c.healthUp[index] = true
+	c.healthRTT[index] = rtt
+	c.healthMu.Unlock()
+}
+
+func (c *Client) markPathDown(index int) {
+	if !c.cfg.FastOpen {
+		return
+	}
+	c.healthMu.Lock()
+	c.healthKnown[index] = true
+	c.healthUp[index] = false
+	c.healthMu.Unlock()
+}
+
+func (c *Client) pathIndices() []int {
+	if !c.cfg.FastOpen {
+		out := make([]int, len(c.paths))
+		for i := range c.paths {
+			out[i] = i
+		}
+		return out
+	}
+
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	if !c.healthReady {
+		out := make([]int, len(c.paths))
+		for i := range c.paths {
+			out[i] = i
+		}
+		return out
+	}
+	var out []int
+	for i := range c.paths {
+		if c.healthKnown[i] && c.healthUp[i] {
+			out = append(out, i)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return c.healthRTT[out[i]] < c.healthRTT[out[j]]
+	})
+	return out
+}
+
+func (c *Client) healthRTTFor(index int) time.Duration {
+	if !c.cfg.FastOpen {
+		return 0
+	}
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	if !c.healthKnown[index] || !c.healthUp[index] {
+		return 0
+	}
+	return c.healthRTT[index]
+}
+
 func (c *Client) handle(local net.Conn) {
 	handedOff := false
 	defer func() {
@@ -146,6 +294,12 @@ func (c *Client) handle(local net.Conn) {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		c.logger.Printf("generate session id: %v", err)
+		return
+	}
+
+	indices := c.pathIndices()
+	if len(indices) == 0 {
+		c.logger.Printf("session %s: no healthy paths", shortSessionID(id))
 		return
 	}
 
@@ -169,9 +323,9 @@ func (c *Client) handle(local net.Conn) {
 	c.sessions[sess] = struct{}{}
 	c.mu.Unlock()
 
-	initial := make(chan pathAttemptResult, len(c.paths))
-	for i, addr := range c.paths {
-		go c.maintainPath(sess, i, addr, initial)
+	initial := make(chan pathAttemptResult, len(indices))
+	for _, i := range indices {
+		go c.maintainPath(sess, i, c.paths[i], initial)
 	}
 
 	// Start as soon as the first path is usable. Waiting for every path adds
@@ -180,7 +334,7 @@ func (c *Client) handle(local net.Conn) {
 	// flowing.
 	timer := time.NewTimer(c.cfg.ConnectWait)
 	defer timer.Stop()
-	pending := len(c.paths)
+	pending := len(indices)
 	ready := false
 	for pending > 0 && !ready {
 		select {
@@ -202,9 +356,28 @@ func (c *Client) handle(local net.Conn) {
 		return
 	}
 	sess.start()
+	if c.cfg.FastOpen {
+		go c.watchFastOpenSetup(sess)
+	}
+}
+
+func (c *Client) watchFastOpenSetup(sess *Session) {
+	timer := time.NewTimer(c.cfg.ConnectWait)
+	defer timer.Stop()
+	select {
+	case <-sess.established:
+	case <-sess.closed:
+	case <-timer.C:
+		sess.closeWithError(fmt.Errorf("%w: no path completed the fastopen handshake", errHandshake))
+	}
 }
 
 func (c *Client) maintainPath(sess *Session, index int, addr string, initial chan<- pathAttemptResult) {
+	if c.cfg.FastOpen {
+		c.maintainPathFastOpen(sess, index, addr, initial)
+		return
+	}
+
 	backoff := c.cfg.ReconnectMin
 	firstAttempt := true
 	resumed := false
@@ -219,6 +392,7 @@ func (c *Client) maintainPath(sess *Session, index int, addr string, initial cha
 
 		conn, err := c.connectPath(sess.ctx, sess.id, uint16(index), addr, resumed)
 		if err != nil {
+			c.markPathDown(index)
 			initialAttempt := firstAttempt
 			if firstAttempt {
 				initial <- pathAttemptResult{index: index, ok: false, err: err}
@@ -253,6 +427,7 @@ func (c *Client) maintainPath(sess *Session, index int, addr string, initial cha
 		}
 
 		resumed = true
+		c.markPathUp(index, 0)
 		backoff = c.cfg.ReconnectMin
 		connectedAt := time.Now()
 		if firstAttempt {
@@ -266,6 +441,107 @@ func (c *Client) maintainPath(sess *Session, index int, addr string, initial cha
 		if sess.isClosed() {
 			return
 		}
+		c.markPathDown(index)
+		if time.Since(connectedAt) >= 10*time.Second {
+			backoff = c.cfg.ReconnectMin
+		} else {
+			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+		}
+		if c.cfg.Verbose {
+			c.logger.Printf("session %s path %d (%s) disconnected; will reconnect", shortSessionID(sess.id), index, addr)
+		}
+	}
+}
+
+func (c *Client) maintainPathFastOpen(sess *Session, index int, addr string, initial chan<- pathAttemptResult) {
+	backoff := c.cfg.ReconnectMin
+	firstAttempt := true
+	resumed := false
+
+	for {
+		if sess.isClosed() {
+			return
+		}
+		if !firstAttempt && !waitContext(sess.ctx, backoff) {
+			return
+		}
+
+		flags := uint8(0)
+		if resumed {
+			flags |= helloFlagResume
+		}
+		start := time.Now()
+		conn, err := c.dialPath(sess.ctx, sess.id, uint16(index), addr, flags)
+		if err != nil {
+			c.markPathDown(index)
+			initialAttempt := firstAttempt
+			if firstAttempt {
+				initial <- pathAttemptResult{index: index, ok: false, err: err}
+				firstAttempt = false
+			}
+			if initialAttempt || c.cfg.Verbose {
+				c.logger.Printf("session %s path %d (%s): connect failed: %v", shortSessionID(sess.id), index, addr, err)
+			}
+			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+			continue
+		}
+
+		p, err := sess.addPathEarly(conn, uint16(index), c.healthRTTFor(index))
+		if err != nil {
+			_ = conn.Close()
+			c.markPathDown(index)
+			if sess.isClosed() {
+				return
+			}
+			if firstAttempt {
+				initial <- pathAttemptResult{index: index, ok: false, err: err}
+				firstAttempt = false
+			}
+			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+			continue
+		}
+
+		// The path can now write. Application data is allowed to run ahead of
+		// HELLO_ACK and is buffered by the server until it installs the path.
+		wasFirst := firstAttempt
+		if firstAttempt {
+			initial <- pathAttemptResult{index: index, ok: true}
+			firstAttempt = false
+		}
+
+		ackErr := c.awaitHelloAck(sess.ctx, conn, sess.id)
+		if ackErr != nil {
+			sess.pathFailed(p, ackErr)
+			c.markPathDown(index)
+			if sess.isClosed() {
+				return
+			}
+			if errors.Is(ackErr, errSessionNotFound) || errors.Is(ackErr, errTargetUnavailable) {
+				sess.closeWithError(fmt.Errorf("path %d: %w", index, ackErr))
+				return
+			}
+			if wasFirst || c.cfg.Verbose {
+				c.logger.Printf("session %s path %d (%s): fastopen handshake failed: %v", shortSessionID(sess.id), index, addr, ackErr)
+			}
+			backoff = nextBackoff(backoff, c.cfg.ReconnectMax)
+			continue
+		}
+
+		p.startReader()
+		sess.markPathEstablished()
+		c.markPathUp(index, time.Since(start))
+		resumed = true
+		backoff = c.cfg.ReconnectMin
+		connectedAt := time.Now()
+		if !wasFirst {
+			c.logger.Printf("session %s path %d (%s) reconnected", shortSessionID(sess.id), index, addr)
+		}
+
+		<-p.done
+		if sess.isClosed() {
+			return
+		}
+		c.markPathDown(index)
 		if time.Since(connectedAt) >= 10*time.Second {
 			backoff = c.cfg.ReconnectMin
 		} else {
@@ -297,6 +573,26 @@ func waitContext(ctx context.Context, d time.Duration) bool {
 }
 
 func (c *Client) connectPath(ctx context.Context, id [16]byte, pathID uint16, addr string, resume bool) (net.Conn, error) {
+	var flags uint8
+	if resume {
+		flags |= helloFlagResume
+	}
+	return c.connectPathFlags(ctx, id, pathID, addr, flags)
+}
+
+func (c *Client) connectPathFlags(ctx context.Context, id [16]byte, pathID uint16, addr string, flags uint8) (net.Conn, error) {
+	conn, err := c.dialPath(ctx, id, pathID, addr, flags)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.awaitHelloAck(ctx, conn, id); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (c *Client) dialPath(ctx context.Context, id [16]byte, pathID uint16, addr string, flags uint8) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: c.cfg.DialTimeout, KeepAlive: 30 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -309,46 +605,44 @@ func (c *Client) connectPath(ctx context.Context, id [16]byte, pathID uint16, ad
 	}
 	_ = conn.SetDeadline(deadline)
 
-	var flags uint8
-	if resume {
-		flags |= helloFlagResume
-	}
 	if err := writeFrame(conn, frameHello, flags, encodeHello(id, pathID)); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send hello: %w", err)
 	}
+	return conn, nil
+}
+
+func (c *Client) awaitHelloAck(ctx context.Context, conn net.Conn, id [16]byte) error {
 	f, err := readFrame(conn)
 	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("read hello acknowledgement: %w", err)
+		return fmt.Errorf("read hello acknowledgement: %w", err)
 	}
 	if f.typ != frameHelloAck {
-		_ = conn.Close()
-		return nil, fmt.Errorf("%w: expected hello acknowledgement, got frame %d", errHandshake, f.typ)
+		return fmt.Errorf("%w: expected hello acknowledgement, got frame %d", errHandshake, f.typ)
 	}
 	ack, err := decodeHelloAck(f.payload)
 	if err != nil {
-		_ = conn.Close()
-		return nil, err
+		return err
 	}
 	if ack.sessionID != id {
-		_ = conn.Close()
-		return nil, fmt.Errorf("%w: session id mismatch", errHandshake)
+		return fmt.Errorf("%w: session id mismatch", errHandshake)
 	}
 	if ack.status != helloStatusOK {
-		_ = conn.Close()
 		if ack.message == "" {
 			ack.message = "server rejected path"
 		}
-		if ack.status == helloStatusSessionNotFound {
-			return nil, fmt.Errorf("%w: %s", errSessionNotFound, ack.message)
+		switch ack.status {
+		case helloStatusSessionNotFound:
+			return fmt.Errorf("%w: %s", errSessionNotFound, ack.message)
+		case helloStatusTargetFailed, helloStatusSessionClosed:
+			return fmt.Errorf("%w: %s", errTargetUnavailable, ack.message)
+		default:
+			return fmt.Errorf("%w: %s", errHandshake, ack.message)
 		}
-		return nil, fmt.Errorf("%w: %s", errHandshake, ack.message)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	if err := ctx.Err(); err != nil {
-		_ = conn.Close()
-		return nil, err
+		return err
 	}
-	return conn, nil
+	return nil
 }

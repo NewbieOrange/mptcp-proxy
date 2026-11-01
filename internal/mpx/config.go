@@ -30,6 +30,12 @@ type Config struct {
 	ReconnectMax  time.Duration
 	NoPathTimeout time.Duration
 
+	// FastOpen starts forwarding application bytes optimistically after each
+	// path sends HELLO instead of waiting for HELLO_ACK. HealthInterval
+	// controls the client's background path/target probes in this mode.
+	FastOpen       bool
+	HealthInterval time.Duration
+
 	Keepalive    time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
@@ -66,6 +72,9 @@ func (c Config) withDefaults() (Config, error) {
 	if c.NoPathTimeout == 0 {
 		c.NoPathTimeout = 10 * time.Minute
 	}
+	if c.HealthInterval == 0 {
+		c.HealthInterval = 30 * time.Second
+	}
 	if c.Keepalive == 0 {
 		c.Keepalive = 20 * time.Second
 	}
@@ -93,6 +102,9 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.ReconnectMin <= 0 || c.ReconnectMax < c.ReconnectMin || c.NoPathTimeout <= 0 {
 		return c, fmt.Errorf("reconnect and no-path timeouts must be positive (max >= min)")
+	}
+	if c.HealthInterval <= 0 {
+		return c, fmt.Errorf("health interval must be positive")
 	}
 	if c.Keepalive < 0 || c.ReadTimeout < 0 || c.WriteTimeout < 0 {
 		return c, fmt.Errorf("timeouts cannot be negative")

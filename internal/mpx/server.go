@@ -142,6 +142,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 		return
 	}
+	if f.flags&helloFlagProbe != 0 {
+		s.handleProbe(conn, hello)
+		return
+	}
 	resume := f.flags&helloFlagResume != 0
 
 	entry, err := s.getEntry(hello.sessionID, resume)
@@ -194,6 +198,23 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	if s.cfg.Verbose {
 		s.logger.Printf("session %s: path from %s (client path %d)", shortSessionID(hello.sessionID), conn.RemoteAddr(), hello.pathID)
+	}
+}
+
+func (s *Server) handleProbe(conn net.Conn, hello helloInfo) {
+	dialer := net.Dialer{Timeout: s.cfg.DialTimeout, KeepAlive: 30 * time.Second}
+	target, err := dialer.Dial("tcp", s.target)
+	status := helloStatusOK
+	message := ""
+	if err != nil {
+		status = helloStatusTargetFailed
+		message = err.Error()
+	} else {
+		_ = target.Close()
+	}
+	_ = writeFrame(conn, frameHelloAck, 0, encodeHelloAck(hello.sessionID, status, hello.pathID, 0, message))
+	if s.cfg.Verbose {
+		s.logger.Printf("probe from %s: status=%d", conn.RemoteAddr(), status)
 	}
 }
 

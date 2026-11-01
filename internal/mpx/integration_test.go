@@ -333,8 +333,12 @@ func startProxyPair(t *testing.T, target string, pathCount int) (string, []*test
 }
 
 func startProxyPairRated(t *testing.T, target string, pathCount int, bytesPerSecond int64) (string, []*testRelay) {
+	addr, relays, _ := startProxyPairConfig(t, target, pathCount, bytesPerSecond, testConfig())
+	return addr, relays
+}
+
+func startProxyPairConfig(t *testing.T, target string, pathCount int, bytesPerSecond int64, cfg Config) (string, []*testRelay, *Client) {
 	t.Helper()
-	cfg := testConfig()
 
 	srv, err := NewServer(cfg, target)
 	if err != nil {
@@ -365,7 +369,7 @@ func startProxyPairRated(t *testing.T, target string, pathCount int, bytesPerSec
 	go func() { _ = cli.Serve(clientLn) }()
 	t.Cleanup(func() { _ = cli.Close() })
 
-	return clientLn.Addr().String(), relays
+	return clientLn.Addr().String(), relays, cli
 }
 
 func pattern(n int) []byte {
@@ -403,6 +407,58 @@ func testTransfer(t *testing.T, proxyAddr string, data []byte) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("echo mismatch: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
+func TestFastOpenMultipathEcho(t *testing.T) {
+	cfg := testConfig()
+	cfg.FastOpen = true
+	cfg.HealthInterval = time.Hour
+	target := startEchoTarget(t)
+	proxyAddr, _, _ := startProxyPairConfig(t, target.Addr(), 4, 0, cfg)
+	testTransfer(t, proxyAddr, pattern(8<<20))
+}
+
+func TestFastOpenEvictsUnhealthyPath(t *testing.T) {
+	cfg := testConfig()
+	cfg.FastOpen = true
+	cfg.HealthInterval = 100 * time.Millisecond
+	target := startEchoTarget(t)
+	_, relays, cli := startProxyPairConfig(t, target.Addr(), 2, 0, cfg)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cli.healthMu.Lock()
+		ready := cli.healthReady
+		cli.healthMu.Unlock()
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("health probes did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	relays[1].Close()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		cli.healthMu.Lock()
+		known := cli.healthKnown[1]
+		up := cli.healthUp[1]
+		cli.healthMu.Unlock()
+		if known && !up {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed path was not evicted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	indices := cli.pathIndices()
+	if len(indices) != 1 || indices[0] != 0 {
+		t.Fatalf("healthy paths = %v, want [0]", indices)
 	}
 }
 
