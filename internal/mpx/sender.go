@@ -57,6 +57,9 @@ func (sn *sender) run() {
 				seq:  sn.nextSeq,
 				data: buf[:n],
 				n:    int64(n),
+				// Keep short bursts on the lowest-RTT path. Once more than
+				// two chunks are in flight, switch to throughput scheduling.
+				lowLatency: sn.unackedBytes+int64(n) <= int64(2*chunkSize),
 			}
 			sn.nextSeq++
 			sn.unacked[it.seq] = it
@@ -206,13 +209,13 @@ func (sn *sender) dispatchLocked() {
 		if len(paths) == 0 {
 			return
 		}
-		p := choosePath(paths, sn.s.cfg.ChunkBytes)
+		it := sn.pending[0]
+		p := choosePath(paths, sn.s.cfg.ChunkBytes, it.lowLatency)
 		if p == nil {
 			sn.cond.Wait()
 			continue
 		}
 
-		it := sn.pending[0]
 		sn.pending = sn.pending[1:]
 		it.assigned = p
 		p.outstandingBytes.Add(it.size())
@@ -279,10 +282,12 @@ func (sn *sender) stop() {
 	sn.mu.Unlock()
 }
 
-func choosePath(paths []*Path, chunkSize int) *Path {
+func choosePath(paths []*Path, chunkSize int, lowLatency bool) *Path {
 	now := time.Now()
 	var best *Path
 	var bestCredit float64
+	var fastest *Path
+	var fastestRTT int64
 	for _, p := range paths {
 		p.refillCredit(now, chunkSize)
 		if p.dead.Load() || len(p.sendQ) >= cap(p.sendQ) {
@@ -292,6 +297,14 @@ func choosePath(paths []*Path, chunkSize int) *Path {
 			best = p
 			bestCredit = p.credit
 		}
+		rtt := p.rttNanos.Load()
+		if rtt > 0 && (fastest == nil || rtt < fastestRTT || (rtt == fastestRTT && p.credit > fastest.credit)) {
+			fastest = p
+			fastestRTT = rtt
+		}
+	}
+	if lowLatency && fastest != nil {
+		return fastest
 	}
 	return best
 }

@@ -327,7 +327,7 @@ func (s *Session) closeWithError(err error) {
 func (s *Session) logSummary(reason error, paths []*Path) {
 	var parts []string
 	for _, p := range paths {
-		parts = append(parts, fmt.Sprintf("path%d[t=%s rx=%d tx=%d rate=%d]", p.id, p.remote, p.rxBytes.Load(), p.txBytes.Load(), p.rateBps.Load()))
+		parts = append(parts, fmt.Sprintf("path%d[t=%s rx=%d tx=%d rate=%d rtt=%s]", p.id, p.remote, p.rxBytes.Load(), p.txBytes.Load(), p.rateBps.Load(), p.rtt().Round(time.Microsecond)))
 	}
 	status := "complete"
 	if reason != nil {

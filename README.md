@@ -28,6 +28,9 @@ a normal TCP connection to `127.0.0.1:8080`.
   path.
 - Upload and download are scheduled independently. Each direction can use the
   full aggregate capacity of all paths.
+- Connection setup starts on the first path that finishes its handshake, not
+  the slowest one. Short request/response bursts use the lowest-RTT path;
+  bulk traffic switches to multipath throughput scheduling.
 - Independent sequence numbers and acknowledgement windows in each direction.
 - Fast receive acknowledgements drive path scheduling; delivery
   acknowledgements are sent only after data has been written to the destination
@@ -113,7 +116,8 @@ On the machine running the application:
 
 Then point the application at `127.0.0.1:8080`. Every accepted application
 connection opens all four paths and uses them concurrently in both directions.
-Each path has its own reconnect loop: if one fails, it is removed immediately,
+Traffic starts as soon as the first path is ready; the remaining paths join
+while the connection is already active. Each path has its own reconnect loop: if one fails, it is removed immediately,
 in-flight chunks move to the remaining paths, and the client keeps trying to
 re-establish that path with backoff. A recovered path rejoins the same session.
 The session stays open while all paths are temporarily down, up to
@@ -146,7 +150,7 @@ single small request may legitimately fit on one path.
 | `-window` | 16 MiB | Unacknowledged bytes allowed per session. The main throughput knob for high bandwidth-delay-product links. |
 | `-chunk` | 64 KiB | Application bytes per multipath frame. |
 | `-queue` | 512 KiB | Approximate per-path data backlog. Smaller means less head-of-line delay; larger smooths bursts. |
-| `-connect-wait` | 5s | How long the client waits for all paths when a connection starts. |
+| `-connect-wait` | 5s | How long the client waits for the first path before failing a new connection. |
 | `-dial-timeout` | 5s | Timeout for dialing one path or the target. |
 | `-reconnect-min` | 250ms | Initial delay before re-dialing a failed client path. |
 | `-reconnect-max` | 5s | Maximum reconnect backoff. |
@@ -177,6 +181,12 @@ path delivers and acknowledges more chunks, it earns credit faster and receives
 a larger share. Per-path queues are deliberately small so a slow path cannot
 accumulate a large backlog and delay everything behind it. TCP itself handles
 reliability and congestion control on each path.
+
+Each path measures its RTT with PING/PONG probes, including an immediate probe
+when the path starts. While a connection is idle or has at most two chunks in
+flight, the sender prefers the lowest-RTT path. This keeps small HTTPS requests
+and interactive traffic off high-latency paths; once a transfer becomes larger,
+the rate-based multipath scheduler takes over.
 
 Upload and download each have their own sender, sequence space, window, and
 path accounting, so both directions aggregate independently.
@@ -221,10 +231,12 @@ make test
 make test-race
 ```
 
-The integration tests emulate rate-limited rinetd paths with in-process TCP
-relays. They cover large transfers, upload and download aggregation, every path
-being used, half-close, concurrent sessions, failover of a path in the middle
-of a transfer, and recovery after all paths disconnect and reconnect.
+The integration tests emulate rate-limited and latency-delayed rinetd paths
+with in-process TCP relays. They cover large transfers, upload and download
+aggregation, every path being used, half-close, concurrent sessions, failover
+of a path in the middle of a transfer, recovery after all paths disconnect and
+reconnect, and a local latency simulation comparing single-relay and
+multipath request/response times.
 
 ## License
 

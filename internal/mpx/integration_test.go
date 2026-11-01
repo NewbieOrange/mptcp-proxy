@@ -104,6 +104,48 @@ func (cw countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// copyWithDelay models one-way propagation delay without serializing every
+// read behind the previous delayed write. Packets enqueued close together stay
+// close together when they arrive.
+func copyWithDelay(dst io.Writer, src io.Reader, delay time.Duration, count *atomic.Int64) error {
+	type packet struct {
+		at   time.Time
+		data []byte
+	}
+	ch := make(chan packet, 128)
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				data := append([]byte(nil), buf[:n]...)
+				ch <- packet{at: time.Now().Add(delay), data: data}
+			}
+			if err != nil {
+				readErr <- err
+				close(ch)
+				return
+			}
+		}
+	}()
+	for p := range ch {
+		if wait := time.Until(p.at); wait > 0 {
+			time.Sleep(wait)
+		}
+		n, err := dst.Write(p.data)
+		count.Add(int64(n))
+		if err != nil {
+			return err
+		}
+	}
+	err := <-readErr
+	if err == io.EOF {
+		return nil
+	}
+	return err
+}
+
 type rateWriter struct {
 	w    io.Writer
 	rate int64
@@ -131,6 +173,7 @@ type testRelay struct {
 	target         string
 	bytes          atomic.Int64
 	bytesPerSecond int64
+	oneWayDelay    time.Duration
 	mu             sync.Mutex
 	conns          map[net.Conn]struct{}
 	closed         bool
@@ -142,6 +185,14 @@ func startTestRelay(t *testing.T, target string) *testRelay {
 }
 
 func startTestRelayRated(t *testing.T, target string, bytesPerSecond int64) *testRelay {
+	return startTestRelaySimulated(t, target, bytesPerSecond, 0)
+}
+
+func startTestRelayDelayed(t *testing.T, target string, oneWayDelay time.Duration) *testRelay {
+	return startTestRelaySimulated(t, target, 0, oneWayDelay)
+}
+
+func startTestRelaySimulated(t *testing.T, target string, bytesPerSecond int64, oneWayDelay time.Duration) *testRelay {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -151,6 +202,7 @@ func startTestRelayRated(t *testing.T, target string, bytesPerSecond int64) *tes
 		listener:       &ln,
 		target:         target,
 		bytesPerSecond: bytesPerSecond,
+		oneWayDelay:    oneWayDelay,
 		conns:          make(map[net.Conn]struct{}),
 	}
 	t.Cleanup(r.Close)
@@ -208,20 +260,28 @@ func (r *testRelay) forward(src net.Conn) {
 	dstOut := io.Writer(dst)
 	srcOut := io.Writer(src)
 	if r.bytesPerSecond > 0 {
-		dstOut = &rateWriter{w: dst, rate: r.bytesPerSecond}
-		srcOut = &rateWriter{w: src, rate: r.bytesPerSecond}
+		dstOut = &rateWriter{w: dstOut, rate: r.bytesPerSecond}
+		srcOut = &rateWriter{w: srcOut, rate: r.bytesPerSecond}
+	}
+
+	copyOneWay := func(w io.Writer, from io.Reader) {
+		if r.oneWayDelay > 0 {
+			_ = copyWithDelay(w, from, r.oneWayDelay, &r.bytes)
+			return
+		}
+		_, _ = io.Copy(countWriter{w: w, n: &r.bytes}, from)
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(countWriter{w: dstOut, n: &r.bytes}, src)
+		copyOneWay(dstOut, src)
 		closeTCPWrite(dst)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(countWriter{w: srcOut, n: &r.bytes}, dst)
+		copyOneWay(srcOut, dst)
 		closeTCPWrite(src)
 	}()
 	wg.Wait()

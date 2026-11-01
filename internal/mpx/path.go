@@ -11,12 +11,13 @@ import (
 )
 
 type outItem struct {
-	seq      uint64
-	data     []byte
-	n        int64
-	fin      bool
-	received bool
-	assigned *Path
+	seq        uint64
+	data       []byte
+	n          int64
+	fin        bool
+	received   bool
+	lowLatency bool
+	assigned   *Path
 }
 
 func (it *outItem) size() int64 {
@@ -39,6 +40,7 @@ type Path struct {
 
 	outstandingBytes atomic.Int64
 	rateBps          atomic.Int64
+	rttNanos         atomic.Int64
 	rxBytes          atomic.Uint64
 	txBytes          atomic.Uint64
 
@@ -122,6 +124,32 @@ func (p *Path) noteRecvAck(n int64) {
 	p.rateMu.Unlock()
 }
 
+func (p *Path) noteRTT(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	old := p.rttNanos.Load()
+	if old == 0 {
+		old = int64(rtt)
+	} else {
+		old = (old*3 + int64(rtt)) / 4
+	}
+	p.rttNanos.Store(old)
+}
+
+func (p *Path) rtt() time.Duration {
+	return time.Duration(p.rttNanos.Load())
+}
+
+func (p *Path) sendPing() bool {
+	now := time.Now().UnixNano()
+	if err := p.writeControl(framePing, 0, uint64Bytes(uint64(now))); err != nil {
+		p.session.pathFailed(p, err)
+		return false
+	}
+	return true
+}
+
 func (p *Path) refillCredit(now time.Time, chunkSize int) {
 	rate := p.rateBps.Load()
 	if rate <= 0 {
@@ -164,6 +192,9 @@ func (p *Path) writeLoop() {
 		tick = ticker.C
 	}
 
+	if !p.sendPing() {
+		return
+	}
 	for {
 		select {
 		case it := <-p.sendQ:
@@ -180,9 +211,7 @@ func (p *Path) writeLoop() {
 				return
 			}
 		case <-tick:
-			now := time.Now().UnixNano()
-			if err := p.writeControl(framePing, 0, uint64Bytes(uint64(now))); err != nil {
-				p.session.pathFailed(p, err)
+			if !p.sendPing() {
 				return
 			}
 		case <-p.done:
@@ -245,8 +274,12 @@ func (p *Path) readLoop() {
 			}
 
 		case framePong:
-			// Keepalive acknowledgement. Receiving any frame already refreshed
-			// the read deadline.
+			if len(f.payload) != 8 {
+				p.session.pathFailed(p, fmt.Errorf("%w: bad pong frame", errProtocol))
+				return
+			}
+			sent := int64(binary.BigEndian.Uint64(f.payload))
+			p.noteRTT(time.Since(time.Unix(0, sent)))
 
 		case frameReset:
 			p.session.fail(fmt.Errorf("%w: peer reset", errProtocol))

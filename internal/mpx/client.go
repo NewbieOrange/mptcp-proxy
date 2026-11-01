@@ -174,15 +174,20 @@ func (c *Client) handle(local net.Conn) {
 		go c.maintainPath(sess, i, addr, initial)
 	}
 
+	// Start as soon as the first path is usable. Waiting for every path adds
+	// the latency of the slowest handshake to every new application
+	// connection; the remaining paths can join while traffic is already
+	// flowing.
 	timer := time.NewTimer(c.cfg.ConnectWait)
 	defer timer.Stop()
 	pending := len(c.paths)
-	for pending > 0 {
+	ready := false
+	for pending > 0 && !ready {
 		select {
 		case r := <-initial:
 			pending--
-			if !r.ok {
-				c.logger.Printf("session %s path %d initial connect failed: %v", shortSessionID(id), r.index, r.err)
+			if r.ok {
+				ready = true
 			}
 		case <-timer.C:
 			pending = 0
@@ -191,14 +196,10 @@ func (c *Client) handle(local net.Conn) {
 		}
 	}
 
-	connected := sess.pathCount()
-	if connected == 0 {
+	if !ready && sess.pathCount() == 0 {
 		c.logger.Printf("session %s: no paths connected", shortSessionID(id))
 		sess.closeWithError(errNoPaths)
 		return
-	}
-	if connected < len(c.paths) {
-		c.logger.Printf("session %s: using %d of %d paths", shortSessionID(id), connected, len(c.paths))
 	}
 	sess.start()
 }

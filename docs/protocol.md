@@ -84,8 +84,9 @@ Status values:
 
 The server creates a session on the first HELLO with a given session ID,
 connects to its configured target, and waits for additional paths. The client
-starts forwarding only after its path dials and handshakes complete (or the
-connect-wait deadline expires).
+starts forwarding as soon as the first path completes its handshake (or fails
+after the connect-wait deadline). The remaining paths join the already-active
+session, so a slow handshake does not delay the application connection.
 
 ## Data transfer and flow control
 
@@ -100,6 +101,11 @@ backlogged and reveal that capacity. The next chunk goes to a path with credit
 and a free queue slot. Credits are capped and path queues are small, so a slow
 path cannot accumulate an unbounded backlog. Per-path TCP supplies ordered
 delivery, loss recovery, and congestion control.
+
+Each path also tracks RTT from PING/PONG probes. When a sender is idle or has at
+most two chunks in flight, it prefers the lowest-RTT path. This keeps short
+request/response bursts and interactive traffic off high-latency paths; bulk
+transfers use the rate-based multipath scheduler.
 
 Upload and download use separate scheduler and sequence-number instances.
 Neither direction limits the other.
@@ -162,8 +168,9 @@ acknowledged and delivered, and the peer's FIN has been received and applied.
 
 ## Keepalives and timeouts
 
-Each path writer sends a PING every `-keepalive` interval. The peer echoes it as
-a PONG. Readers apply `-read-timeout` to every frame read and writers apply
+Each path writer sends an immediate PING when the path starts and another every
+`-keepalive` interval. The peer echoes it as a PONG, and the sender keeps an
+EWMA of the measured RTT for latency-aware scheduling. Readers apply `-read-timeout` to every frame read and writers apply
 `-write-timeout` to each write. A timeout removes that path and triggers the
 same failover path as any other connection error.
 
